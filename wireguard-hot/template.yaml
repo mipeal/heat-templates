@@ -1,0 +1,299 @@
+# template.yaml
+
+heat_template_version: 2021-04-16
+
+description: >
+  Heat template to set up a network with Wireguard and Docker on a server, including a pre-created floating IP.
+
+parameters:
+  gateway_address_uuid:
+    type: string
+    description: UUID for the external gateway
+    default: 0b537b33-d135-493a-bd97-3d5ce9e6dea6
+  stack_name:
+    type: string
+    description: Name of the stack to be appended as a suffix
+    default: s2g-wireguard
+  private_cidr:
+    type: string
+    description: Private CIDR block for subnet
+    default: 172.168.100.0/27
+  floating_ip_uuid:
+    type: string
+    description: UUID for the pre-created floating IP
+    default: 391fb313-7828-4a1e-bf0d-577078e85dd1
+  image_id:
+    type: string
+    description: ID of the image to use for the server
+    default: db1bc18e-81e3-477e-9067-eecaa459ec33
+  flavor_name:
+    type: string
+    description: Name of the flavor to use for the server
+    default:  gx3.4c4r
+  key_pair_name:
+    type: string
+    description: Name of the keypair to use for the server
+    default: s2g-wireguard
+  vpn_domain:
+    type: string
+    description: Domain name for the VPN
+    default: vpn.s2g.ncr.ntnu.no
+  admin_user:
+    type: string
+    description: Admin user for WG Portal
+    default: mmpeal@ntnu.no
+  admin_pass:
+    type: string
+    description: Admin password for WG Portal
+    default: gn5g9ZWJJMGxA2vwngzq
+
+resources:
+  my_router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: { get_param: gateway_address_uuid }
+      name: { list_join: ['', ['router-', get_param: stack_name]] }
+
+  my_network:
+    type: OS::Neutron::Net
+    properties:
+      name: { list_join: ['', ['network-', get_param: stack_name]] }
+
+  my_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network_id: { get_resource: my_network }
+      cidr: { get_param: private_cidr }
+      name: { list_join: ['', ['subnet-', get_param: stack_name]] }
+  
+  my_router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router: { get_resource: my_router }
+      subnet: { get_resource: my_subnet }
+
+
+  my_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: { list_join: ['', ['sg-', get_param: stack_name]] }
+      rules:
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+          remote_ip_prefix: 10.0.0.0/8
+        - protocol: tcp
+          port_range_min: 443
+          port_range_max: 443
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: udp
+          port_range_min: 51820 # Assuming 51820 as the Wireguard port
+          port_range_max: 51820
+          remote_ip_prefix: 0.0.0.0/0
+
+  my_port:
+    depends_on:
+      - my_router
+      - my_subnet
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: my_network }
+      security_groups: [{ get_resource: my_security_group }]
+      name: { list_join: ['', ['port-', get_param: stack_name]] }
+
+  cloud_config_wireguard:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        write_files:
+        - path: /tmp/install_wireguard.sh
+          content:
+            str_replace:
+              template: |
+                #!/bin/bash
+                sudo apt-get update -y
+                sudo apt-get install ca-certificates curl gnupg certbot python3-certbot-nginx -y
+                sudo install -m 0755 -d /etc/apt/keyrings
+                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+                sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+                # Add the repository to Apt sources:
+                echo \
+                  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+                  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+                  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+                sudo apt-get update -y
+
+                sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
+                sudo usermod -aG docker ubuntu
+
+                sudo apt install -y wireguard qrencode
+                
+                SERVER_PUBLIC_NIC="ens3"
+                WG_NIC="wg0"
+                WG_IP="172.200.0.1/24"
+                WG_PORT="51820"
+
+                sudo wg genkey | sudo tee /etc/wireguard/privatekey | sudo wg pubkey | sudo tee /etc/wireguard/publickey
+
+                sudo sh -c "echo '[Interface]
+                Address = $WG_IP
+                ListenPort = $WG_PORT
+                PrivateKey = $(cat /etc/wireguard/privatekey)
+                PostUp = iptables -A FORWARD -i $WG_NIC -j ACCEPT; iptables -A FORWARD -o $WG_NIC -j ACCEPT; iptables -t nat -A POSTROUTING -o $SERVER_PUBLIC_NIC -j MASQUERADE
+                PostDown = iptables -D FORWARD -i $WG_NIC -j ACCEPT; iptables -D FORWARD -o $WG_NIC -j ACCEPT; iptables -t nat -D POSTROUTING -o $SERVER_PUBLIC_NIC -j MASQUERADE' > /etc/wireguard/$WG_NIC.conf"
+
+                sudo sh -c "echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-sysctl.conf"
+                sudo sysctl -p
+
+                sudo wg-quick up $WG_NIC
+                sudo systemctl enable wg-quick@$WG_NIC
+
+                mkdir -p /home/ubuntu/wireguard-dashboard
+
+                echo '
+                advanced:
+                  log_level: info
+
+                core:
+                  admin_user: mmpeal@ntnu.no
+                  admin_password: gn5g9ZWJJMGxA2vwngzq
+                  self_provisioning_allowed: true
+
+
+                mail:
+                  host: smtp.ansatt.ntnu.no
+                  port: 587
+                  encryption: starttls
+                  username: ncrsender
+                  password: Ou2chooW@e
+                  auth_type: login
+                  from: WireGuard VPN <noreply+wireguard@ncr.ntnu.no>
+
+                web:
+                  request_logging: true
+                  session_secret: keGRMINtUsT
+                  site_title: "S2G CTF"
+                  site_company_name: "Norwegian Cyber Range"
+
+                database:
+                  typ: sqlite
+                  database: data/wg_portal.db
+                ' | sudo tee -a /home/ubuntu/wireguard-dashboard/config.yml >/dev/null
+
+                sudo certbot certonly --nginx --non-interactive --agree-tos --email md.m.i.peal@ntnu.no --domains $vpn_domain
+                mkdir -p /home/ubuntu/wireguard-dashboard/ssl
+                cp /etc/letsencrypt/live/$vpn_domain/fullchain.pem /home/ubuntu/wireguard-dashboard/ssl
+                cp /etc/letsencrypt/live/$vpn_domain/privkey.pem /home/ubuntu/wireguard-dashboard/ssl
+
+                echo '
+                events {}
+
+                http {
+                    server {
+                        listen 443 ssl;
+                        server_name $vpn_domain;
+
+                        ssl_certificate /etc/nginx/ssl/fullchain.pem;
+                        ssl_certificate_key /etc/nginx/ssl/privkey.pem;
+
+                        location / {
+                            proxy_pass http://host.docker.internal:8123;
+                            proxy_set_header Host $host;
+                            proxy_set_header X-Real-IP $remote_addr;
+                            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                            proxy_set_header X-Forwarded-Proto $scheme;
+                        }
+                    }
+                }
+                ' | sudo tee -a /home/ubuntu/wireguard-dashboard/nginx.con >/dev/null
+                echo '
+                version: '3.6'
+                services:
+                  wg-portal:
+                    image: wgportal/wg-portal:v1
+                    container_name: wg-portal
+                    restart: unless-stopped
+                    cap_add:
+                      - NET_ADMIN
+                    network_mode: "host"
+                    volumes:
+                      - /etc/wireguard:/etc/wireguard
+                      - ./data:/app/data
+                      - ./config.yml:/app/config.yml
+                    environment:
+                      # WireGuard Settings
+                      - WG_DEVICES=wg0
+                      - WG_DEFAULT_DEVICE=wg0
+                      - WG_CONFIG_PATH=/etc/wireguard
+                      # Core Settings
+                      - EXTERNAL_URL=https://$vpn_domain
+                      - WEBSITE_TITLE=S2G CTF
+                      - COMPANY_NAME=Norwegian Cyber Range
+                      - ADMIN_USER=$admin_user
+                      - ADMIN_PASS=$admin_pass
+                      - SELF_PROVISIONING=true
+
+                  nginx:
+                    image: nginx:latest
+                    container_name: nginx-reverse-proxy
+                    restart: unless-stopped
+                    ports:
+                      - "443:443"
+                    volumes:
+                      - ./nginx.conf:/etc/nginx/nginx.conf
+                      - ./ssl:/etc/nginx/ssl
+                    depends_on:
+                      - wg-portal
+                    ' | sudo tee -a /home/ubuntu/wireguard-dashboard/docker-compose.yml >/dev/null
+
+                su -c 'cd /home/ubuntu/wireguard-dashboard && docker compose up -d' ubuntu
+              params:
+                $vpn_domain: { get_param: vpn_domain }
+                $admin_user: { get_param: admin_user }
+                $admin_pass: { get_param: admin_pass }
+          permissions: '0755'
+        runcmd:
+        - [ chmod, +x, /tmp/install_wireguard.sh ]
+        - [ bash, /tmp/install_wireguard.sh ]
+
+  my_server_config:
+    type: OS::Heat::MultipartMime
+    properties:
+      parts:
+      - config: { get_resource: cloud_config_wireguard }
+
+  my_server:
+    depends_on:
+      - my_port
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image_id }
+      flavor: { get_param: flavor_name }
+      key_name: { get_param: key_pair_name }
+      networks:
+        - port: { get_resource: my_port }
+      user_data_format: SOFTWARE_CONFIG
+      user_data:
+        get_resource: my_server_config
+      name: { list_join: ['', ['server-', get_param: stack_name]] }
+
+  my_floating_ip:
+    type: OS::Neutron::FloatingIP
+    external_id: { get_param: floating_ip_uuid }
+    
+  floating_ip_association:
+    depends_on:
+      - my_server
+      - my_port
+      - my_router
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: my_floating_ip }
+      port_id: { get_resource: my_port }
+
+outputs:
+  server_ip:
+    description: The IP address of the server
+    value: { get_attr: [my_server, first_address] }
