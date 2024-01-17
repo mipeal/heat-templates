@@ -1,0 +1,257 @@
+# template.yaml
+
+heat_template_version: 2021-04-16
+
+description: >
+  Heat template to set up a network with mattermost and Docker on a server, including a pre-created floating IP.
+
+parameters:
+  gateway_address_uuid:
+    type: string
+    description: UUID for the external gateway
+    default: 0b537b33-d135-493a-bd97-3d5ce9e6dea6
+  stack_name:
+    type: string
+    description: Name of the stack to be appended as a suffix
+    default: ncr-mattermost
+  private_cidr:
+    type: string
+    description: Private CIDR block for subnet
+    default: 172.168.100.0/27
+  floating_ip_uuid:
+    type: string
+    description: UUID for the pre-created floating IP
+    default: 391fb313-7828-4a1e-bf0d-577078e85dd1
+  image_id:
+    type: string
+    description: ID of the image to use for the server
+    default: db1bc18e-81e3-477e-9067-eecaa459ec33
+  flavor_name:
+    type: string
+    description: Name of the flavor to use for the server
+    default:  gx3.4c4r
+  key_pair_name:
+    type: string
+    description: Name of the keypair to use for the server
+    default: ncr-mattermost
+  domain:
+    type: string
+    description: Domain name for the VPN
+    default: $domain
+  admin_user:
+    type: string
+    description: Admin user for WG Portal
+    default: mmpeal@ntnu.no
+  admin_pass:
+    type: string
+    description: Admin password for WG Portal
+    default: gn5g9ZWJJMGxA2vwngzq
+
+resources:
+  my_router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: { get_param: gateway_address_uuid }
+      name: { list_join: ['', ['router-', get_param: stack_name]] }
+
+  my_network:
+    type: OS::Neutron::Net
+    properties:
+      name: { list_join: ['', ['network-', get_param: stack_name]] }
+
+  my_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network_id: { get_resource: my_network }
+      cidr: { get_param: private_cidr }
+      name: { list_join: ['', ['subnet-', get_param: stack_name]] }
+  
+  my_router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router: { get_resource: my_router }
+      subnet: { get_resource: my_subnet }
+
+
+  my_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: { list_join: ['', ['sg-', get_param: stack_name]] }
+      rules:
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+          remote_ip_prefix: 10.0.0.0/8
+        - protocol: tcp
+          port_range_min: 80
+          port_range_max: 80
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
+          port_range_min: 443
+          port_range_max: 443
+          remote_ip_prefix: 0.0.0.0/0
+
+  my_port:
+    depends_on:
+      - my_router
+      - my_subnet
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: my_network }
+      security_groups: [{ get_resource: my_security_group }]
+      name: { list_join: ['', ['port-', get_param: stack_name]] }
+
+  cloud_config_mattermost:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        write_files:
+        - path: /tmp/install_mattermost.sh
+          content:
+            str_replace:
+              template: |
+                #!/bin/bash
+                sudo apt-get update -y
+                sudo apt-get install ca-certificates curl gnupg certbot nginx python3-certbot-nginx -y
+                sudo install -m 0755 -d /etc/apt/keyrings
+                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+                sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+                # Add the repository to Apt sources:
+                echo \
+                  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+                  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+                  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+                sudo apt-get update -y
+
+                sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
+                sudo usermod -aG docker ubuntu
+
+                sudo rm /etc/nginx/sites-available/default
+                sudo systemctl reload nginx
+
+                sudo certbot certonly --nginx --non-interactive --agree-tos --email md.m.i.peal@ntnu.no --domains $domain
+
+                echo '
+                version: "3"
+
+                services:
+                  postgres:
+                    image: postgres:latest
+                    environment:
+                      POSTGRES_DB: mattermost
+                      POSTGRES_USER: mmuser
+                      POSTGRES_PASSWORD: mmuser_password
+                    volumes:
+                      - postgres_data:/var/lib/postgresql/data
+                    ports:
+                      - "5432:5432"
+
+                volumes:
+                  postgres_data:
+
+                    ' | sudo tee -a /home/ubuntu/mattermost/docker-compose.yml >/dev/null
+                
+                su -c 'cd /home/ubuntu/mattermost && docker compose up -d' ubuntu
+
+                echo "Waiting for PostgreSQL to be ready..."
+                sleep 10
+
+                echo "Configuring Mattermost to use PostgreSQL..."
+                sudo sed -i 's|"DriverName": "mysql"|"DriverName": "postgres"|g' /opt/mattermost/config/config.json
+                sudo sed -i 's|"DataSource": ".*"|"DataSource": "postgres://mmuser:mmuser_password@localhost:5432/mattermost?sslmode=disable&connect_timeout=10"|g' /opt/mattermost/config/config.json
+
+                echo "Configuring Nginx as a reverse proxy for Mattermost..."
+
+                echo '
+                server {
+                    listen 80;
+                    server_name $domain;
+                    return 301 https://\$host\$request_uri;
+
+                    access_log /var/log/nginx/mattermost_access.log;
+                    error_log /var/log/nginx/mattermost_error.log;
+                }
+
+                server {
+                    listen 443 ssl http2;
+                    server_name $domain;
+
+                    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
+                    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+                    include /etc/letsencrypt/options-ssl-nginx.conf;
+                    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+                    access_log /var/log/nginx/mattermost_access.log;
+                    error_log /var/log/nginx/mattermost_error.log;
+                    
+                    location / {
+                        proxy_pass http://localhost:8065;
+                        proxy_http_version 1.1;
+                        proxy_set_header Upgrade \$http_upgrade;
+                        proxy_set_header Connection "upgrade";
+                        proxy_set_header Host \$http_host;
+                        proxy_set_header X-Real-IP \$remote_addr;
+                        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                        proxy_set_header X-Forwarded-Proto \$scheme;
+                        proxy_set_header X-Frame-Options SAMEORIGIN;
+                        proxy_buffers 256 16k;
+                        proxy_buffer_size 16k;
+                        client_max_body_size 50M;
+                        proxy_read_timeout 600s;
+                        proxy_send_timeout 600s;
+                    }
+                }
+                  ' | sudo tee -a /etc/nginx/sites-available/mattermost >/dev/null
+
+                # Enable the Nginx configuration
+                sudo ln -s /etc/nginx/sites-available/mattermost /etc/nginx/sites-enabled/mattermost
+                sudo nginx -t
+                sudo systemctl reload nginx
+              params:
+                $domain: { get_param: domain }
+          permissions: '0755'
+        runcmd:
+        - [ chmod, +x, /tmp/install_mattermost.sh ]
+        - [ bash, /tmp/install_mattermost.sh ]
+
+  my_server_config:
+    type: OS::Heat::MultipartMime
+    properties:
+      parts:
+      - config: { get_resource: cloud_config_mattermost }
+
+  my_server:
+    depends_on:
+      - my_port
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image_id }
+      flavor: { get_param: flavor_name }
+      key_name: { get_param: key_pair_name }
+      networks:
+        - port: { get_resource: my_port }
+      user_data_format: SOFTWARE_CONFIG
+      user_data:
+        get_resource: my_server_config
+      name: { list_join: ['', ['server-', get_param: stack_name]] }
+
+  my_floating_ip:
+    type: OS::Neutron::FloatingIP
+    external_id: { get_param: floating_ip_uuid }
+    
+  floating_ip_association:
+    depends_on:
+      - my_server
+      - my_port
+      - my_router
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: my_floating_ip }
+      port_id: { get_resource: my_port }
+
+outputs:
+  server_ip:
+    description: The IP address of the server
+    value: { get_attr: [my_server, first_address] }

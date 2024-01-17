@@ -1,0 +1,34 @@
+# parameter.yaml
+
+parameters:
+  gateway_address_uuid:
+    type: string
+    description: UUID for the external gateway
+  stack_name:
+    type: string
+    description: Name of the stack to be appended as a suffix
+  private_cidr:
+    type: string
+    description: Private CIDR block for subnet
+  image_id:
+    type: string
+    description: ID of the image to use for the server
+  flavor_name:
+    type: string
+    description: Name of the flavor to use for the server
+  key_pair_name:
+    type: string
+    description: Name of the keypair to use for the server
+  floating_ip_uuid:
+    type: string
+    description: UUID for the pre-created floating IP
+  vpn_domain:
+    type: string
+    description: Domain name for the VPN
+  admin_user:
+    type: string
+    description: Admin user for WG Portal
+  admin_pass:
+    type: string
+    description: Admin password for WG Portal
+
