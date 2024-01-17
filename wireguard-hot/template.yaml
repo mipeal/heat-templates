@@ -207,7 +207,7 @@ resources:
                         }
                     }
                 }
-                ' | sudo tee -a /home/ubuntu/wireguard-dashboard/nginx.con >/dev/null
+                ' | sudo tee -a /home/ubuntu/wireguard-dashboard/nginx.conf >/dev/null
                 echo '
                 version: '3.6'
                 services:
@@ -250,7 +250,7 @@ resources:
 
                 sudo rm /etc/nginx/sites-available/default
                 sudo systemctl reload nginx
-                
+
                 su -c 'cd /home/ubuntu/wireguard-dashboard && docker compose up -d' ubuntu
               params:
                 $vpn_domain: { get_param: vpn_domain }
