@@ -248,6 +248,9 @@ resources:
                       - wg-portal
                     ' | sudo tee -a /home/ubuntu/wireguard-dashboard/docker-compose.yml >/dev/null
 
+                sudo rm /etc/nginx/sites-available/default
+                sudo systemctl reload nginx
+                
                 su -c 'cd /home/ubuntu/wireguard-dashboard && docker compose up -d' ubuntu
               params:
                 $vpn_domain: { get_param: vpn_domain }
