@@ -1,0 +1,171 @@
+# template.yaml
+
+heat_template_version: 2021-04-16
+
+description: >
+  Heat template to set up a network with Wireguard and Docker on a server, including a pre-created floating IP.
+
+parameters:
+  gateway_address_uuid:
+    type: string
+    description: UUID for the external gateway
+    default: 7b4df2ac-be48-44fc-888e-3706f49b86e3
+  stack_name:
+    type: string
+    description: Name of the stack to be appended as a suffix
+    default: kommuneovelser-test
+  private_cidr:
+    type: string
+    description: Private CIDR block for subnet
+    default: 172.168.100.0/27
+  floating_ip_uuid:
+    type: string
+    description: UUID for the pre-created floating IP
+    default: 
+  image_id:
+    type: string
+    description: ID of the image to use for the server
+    default: c15481d3-e1ac-4331-9379-c63cb14d12b1
+  flavor_name:
+    type: string
+    description: Name of the flavor to use for the server
+    default:  gx3.4c4r
+  key_pair_name:
+    type: string
+    description: Name of the keypair to use for the server
+    default: mmpeal
+
+resources:
+  my_router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: { get_param: gateway_address_uuid }
+      name: { list_join: ['', ['router-', get_param: stack_name]] }
+
+  my_network:
+    type: OS::Neutron::Net
+    properties:
+      name: { list_join: ['', ['network-', get_param: stack_name]] }
+
+  my_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network_id: { get_resource: my_network }
+      cidr: { get_param: private_cidr }
+      name: { list_join: ['', ['subnet-', get_param: stack_name]] }
+  
+  my_router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router: { get_resource: my_router }
+      subnet: { get_resource: my_subnet }
+
+
+  my_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: { list_join: ['', ['sg-', get_param: stack_name]] }
+      rules:
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+          remote_ip_prefix: 10.0.0.0/8
+        - protocol: tcp
+          port_range_min: 80
+          port_range_max: 80
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
+          port_range_min: 443
+          port_range_max: 443
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
+          port_range_min: 514 
+          port_range_max: 514
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: udp
+          port_range_min: 514 
+          port_range_max: 514
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
+          port_range_min: 1514 
+          port_range_max: 1515
+          remote_ip_prefix: 0.0.0.0/0
+
+  my_port:
+    depends_on:
+      - my_router
+      - my_subnet
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: my_network }
+      security_groups: [{ get_resource: my_security_group }]
+      name: { list_join: ['', ['port-', get_param: stack_name]] }
+
+  cloud_config_wireguard:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        write_files:
+        - path: /tmp/install_wireguard.sh
+          content: |
+            #!/bin/bash
+            sudo apt-get update -y
+            sudo apt-get install ca-certificates curl gnupg certbot python3-certbot-nginx -y
+            sudo install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+            # Add the repository to Apt sources:
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+              $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+              sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            sudo apt-get update -y
+
+            sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
+            sudo usermod -aG docker ubuntu
+          permissions: '0755'
+        runcmd:
+        - [ chmod, +x, /tmp/install_wireguard.sh ]
+        - [ bash, /tmp/install_wireguard.sh ]
+
+  my_server_config:
+    type: OS::Heat::MultipartMime
+    properties:
+      parts:
+      - config: { get_resource: cloud_config_wireguard }
+
+  my_server:
+    depends_on:
+      - my_port
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image_id }
+      flavor: { get_param: flavor_name }
+      key_name: { get_param: key_pair_name }
+      networks:
+        - port: { get_resource: my_port }
+      user_data_format: SOFTWARE_CONFIG
+      user_data:
+        get_resource: my_server_config
+      name: { list_join: ['', ['server-', get_param: stack_name]] }
+
+  my_floating_ip:
+    type: OS::Neutron::FloatingIP
+    external_id: { get_param: floating_ip_uuid }
+    
+  floating_ip_association:
+    depends_on:
+      - my_server
+      - my_port
+      - my_router
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: my_floating_ip }
+      port_id: { get_resource: my_port }
+
+outputs:
+  server_ip:
+    description: The IP address of the server
+    value: { get_attr: [my_server, first_address] }
