@@ -84,6 +84,10 @@ resources:
           port_range_max: 22
           remote_ip_prefix: 10.0.0.0/8
         - protocol: tcp
+          port_range_min: 80
+          port_range_max: 80
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
           port_range_min: 443
           port_range_max: 443
           remote_ip_prefix: 0.0.0.0/0
@@ -192,6 +196,11 @@ resources:
 
                 http {
                     server {
+                        listen 80;
+                        server_name $vpn_domain;
+                        return 301 https://$host$request_uri;
+                    }
+                    server {
                         listen 443 ssl;
                         server_name $vpn_domain;
 
@@ -234,6 +243,14 @@ resources:
                       - ADMIN_USER=$admin_user
                       - ADMIN_PASS=$admin_pass
                       - SELF_PROVISIONING=true
+                      # Mail Settings
+                      - MAIL_FROM=WireGuard VPN <noreply+wireguard@ncr.ntnu.no>
+                      - EMAIL_HOST=smtp.ansatt.ntnu.no
+                      - EMAIL_PORT=587
+                      - EMAIL_ENCRYPTION=starttls
+                      - EMAIL_USERNAME=ncrsender
+                      - EMAIL_PASSWORD=Ou2chooW@e
+                      - EMAIL_AUTHTYPE=login
 
                   nginx:
                     image: nginx:latest
@@ -241,6 +258,7 @@ resources:
                     restart: unless-stopped
                     ports:
                       - "443:443"
+                      - "80:80"
                     volumes:
                       - ./nginx.conf:/etc/nginx/nginx.conf
                       - ./ssl:/etc/nginx/ssl
